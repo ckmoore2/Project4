@@ -1,0 +1,121 @@
+pipeline {
+    // Kubernetes agent configuration
+    agent {
+        kubernetes {
+            // Inline YAML for pod template
+            yaml '''
+            apiVersion: v1
+            kind: Pod
+            spec:
+              containers:
+              - name: maven
+                image: maven:3.9.9-eclipse-temurin-21-alpine
+                command:
+                - cat
+                tty: true
+                volumeMounts:
+                - name: maven-cache
+                  mountPath: /root/.m2
+              - name: docker
+                image: docker:latest
+                command:
+                - cat
+                tty: true
+                volumeMounts:
+                - name: dockersock
+                  mountPath: /var/run/docker.sock
+              volumes:
+              - name: maven-cache
+                persistentVolumeClaim:
+                  claimName: maven-repo-pvc
+              - name: dockersock
+                hostPath:
+                  path: /var/run/docker.sock
+            '''
+            
+            // Optional: Default container
+            defaultContainer 'maven'
+        }
+    }
+    
+    // Environment configuration
+    environment {
+        // Kubernetes-specific environment variables
+        KUBERNETES_REGISTRY = 'your-kubernetes-registry.com'
+        APP_NAME = 'sample-java-app'
+        VERSION = "${env.BUILD_NUMBER}"
+    }
+    
+    stages {
+        stage('Prepare') {
+            steps {
+                container('maven') {
+                    sh 'mvn clean validate'
+                }
+            }
+        }
+        
+        stage('Build') {
+            steps {
+                container('maven') {
+                    sh 'mvn compile package -DskipTests=true'
+                }
+            }
+        }
+        
+        stage('Test') {
+            steps {
+                container('maven') {
+                    sh 'mvn test'
+                }
+            }
+            post {
+                always {
+                    junit '**/target/surefire-reports/TEST-*.xml'
+                }
+            }
+        }
+        
+        stage('Docker Build') {
+            steps {
+                container('docker') {
+                    script {
+                        docker.build("${KUBERNETES_REGISTRY}/${APP_NAME}:${VERSION}")
+                    }
+                }
+            }
+        }
+        
+        stage('Kubernetes Deploy') {
+            steps {
+                container('docker') {
+                    script {
+                        // Push to registry
+                        docker.withRegistry('https://${KUBERNETES_REGISTRY}', 'kubernetes-credentials') {
+                            docker.image("${KUBERNETES_REGISTRY}/${APP_NAME}:${VERSION}").push()
+                        }
+                        
+                        // Optional: Deploy to Kubernetes
+                        sh """
+                        kubectl set image deployment/${APP_NAME} ${APP_NAME}=${KUBERNETES_REGISTRY}/${APP_NAME}:${VERSION}
+                        """
+                    }
+                }
+            }
+        }
+    }
+    
+    post {
+        success {
+            echo 'Build successful! Deployed to Kubernetes.'
+        }
+        
+        failure {
+            echo 'Build failed. Rolling back...'
+        }
+        
+        always {
+            cleanWs()
+        }
+    }
+}
